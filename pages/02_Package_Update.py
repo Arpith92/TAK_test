@@ -29,7 +29,7 @@ except Exception:
 # ----------------------------
 # --- Admin-only gate for THIS page (no PIN login here) ---
 def require_admin():
-    ADMIN_PASS_DEFAULT = "Arpith&92--"  # your admin password
+    ADMIN_PASS_DEFAULT = "Arpith&92"  # your admin password
     ADMIN_PASS = str(st.secrets.get("admin_pass", ADMIN_PASS_DEFAULT))
 
     with st.sidebar:
