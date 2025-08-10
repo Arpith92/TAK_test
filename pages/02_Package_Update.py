@@ -17,7 +17,7 @@ from pymongo import MongoClient
 # Page config
 # ----------------------------
 st.set_page_config(page_title="Package Update", layout="wide")
-st.title("📦 Package Update")
+st.title("📦 Package Update (Admin)")
 
 # Optional: pretty calendar
 CALENDAR_AVAILABLE = True
@@ -27,48 +27,44 @@ except Exception:
     CALENDAR_AVAILABLE = False
 
 # ----------------------------
-# Fallback loader for users (if Cloud Secrets miss [users])
+# Admin gate for THIS page
+# ----------------------------
+ADMIN_PASS_DEFAULT = "Arpith&92--"  # requested
+ADMIN_PASS = st.secrets.get("admin_pass", ADMIN_PASS_DEFAULT)
+
+with st.sidebar:
+    st.markdown("### Admin access")
+    p = st.text_input("Enter admin password", type="password", key="__admin__")
+    if p != ADMIN_PASS:
+        st.stop()
+
+# ----------------------------
+# Fallback loader for users (kept in case you want to extend later)
 # ----------------------------
 def load_users() -> dict:
-    """
-    1) Prefer Cloud Secrets: st.secrets["users"]
-    2) Fallback to repo file: .streamlit/secrets.toml (table [users])
-    Returns {} if none found.
-    """
     users = st.secrets.get("users", None)
     if isinstance(users, dict) and users:
         return users
-
-    # Try reading the repo's .streamlit/secrets.toml (for local/dev or fallback)
     try:
         try:
-            import tomllib  # Python 3.11+
-        except Exception:  # pragma: no cover
-            import tomli as tomllib  # older pythons
-
+            import tomllib  # 3.11+
+        except Exception:
+            import tomli as tomllib
         with open(".streamlit/secrets.toml", "rb") as f:
             data = tomllib.load(f)
         u = data.get("users", {})
         if isinstance(u, dict) and u:
             with st.sidebar:
-                st.warning(
-                    "Using users from repo .streamlit/secrets.toml. "
-                    "For production, set them in Manage app → Secrets."
-                )
+                st.warning("Using users from repo .streamlit/secrets.toml.")
             return u
     except Exception:
         pass
     return {}
 
 # ----------------------------
-# Enforced PIN login (+ Logout)
+# Optional: PIN login (you can remove if you only want the admin pass)
 # ----------------------------
 def _login() -> Optional[str]:
-    """
-    Enforce PIN login. Uses load_users() so it works even if Cloud secrets were
-    not saved correctly. Shows a helpful hint if misconfigured.
-    """
-    # Logout button
     with st.sidebar:
         if st.session_state.get("user"):
             st.markdown(f"**Signed in as:** {st.session_state['user']}")
@@ -80,24 +76,8 @@ def _login() -> Optional[str]:
         return st.session_state["user"]
 
     users_map = load_users()
-
-    # If still missing, show helpful hint + secrets keys.
-    if not isinstance(users_map, dict) or not users_map:
-        with st.sidebar:
-            st.caption("Secrets debug")
-            try:
-                st.write("keys:", list(st.secrets.keys()))
-            except Exception:
-                st.write("keys: unavailable")
-            st.write("users type:", type(st.secrets.get("users", None)).__name__)
-        st.error(
-            "Login is not configured yet.\n\n"
-            "Go to **Manage app → Secrets** and add (single-line URI, then a blank line, "
-            "then the users table):\n\n"
-            'mongo_uri = "mongodb+srv://…"\n\n'
-            "[users]\nArpith = \"1234\"\nReena  = \"5678\"\nTeena  = \"7777\"\nKuldeep = \"8888\"\n"
-        )
-        st.stop()
+    if not users_map:
+        return "admin"  # allow admin-only mode via password gate above
 
     st.markdown("### 🔐 Login")
     c1, c2 = st.columns([1, 1])
@@ -112,14 +92,11 @@ def _login() -> Optional[str]:
             st.success(f"Welcome, {name}!")
             st.rerun()
         else:
-            st.error("Invalid PIN")
-            st.stop()
-
+            st.error("Invalid PIN"); st.stop()
     return None
 
-# Gate the page until logged in
 user = _login()
-if not user:
+if user is None:
     st.stop()
 
 # ----------------------------
@@ -161,7 +138,7 @@ VENDOR_SHEETS = {
 }
 
 # ----------------------------
-# Helpers (BSON-safe conversions)
+# Helpers
 # ----------------------------
 def _to_dt_or_none(x):
     if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
@@ -370,6 +347,7 @@ def save_vendor_pay(itinerary_id: str, items: list[dict], final_done: bool):
     col_vendorpay.update_one({"itinerary_id": str(itinerary_id)}, {"$set": doc}, upsert=True)
 
 def upsert_status(itinerary_id, status, booking_date, advance_amount, assigned_to=None):
+    # compute incentive if confirming
     incentive = 0
     rep_name = ""
     if status == "confirmed":
@@ -475,7 +453,7 @@ k4.metric("🔴 Cancelled", int(cancelled_count))
 st.divider()
 
 # ----------------------------
-# 1) Status Update
+# 1) Status Update (NO follow-ups here)
 # ----------------------------
 st.subheader("1) Update Status")
 view_mode = st.radio("View mode", ["Latest per client (by mobile)", "All packages"], horizontal=True)
@@ -486,10 +464,11 @@ if view_mode == "Latest per client (by mobile)":
 else:
     editable = df.copy()
 
-editable = editable[editable["status"].isin(["pending","under_discussion","followup"])].copy()
+# Only show items still in sales pipeline (remove followup from this page)
+editable = editable[editable["status"].isin(["pending","under_discussion"])].copy()
 
 if editable.empty:
-    st.success("No pending / under-discussion / follow-up items right now. 🎉")
+    st.success("Nothing to update right now. 🎉")
 else:
     must_cols = [
         "ach_id","itinerary_id","client_name","client_mobile","final_route","total_pax",
@@ -512,7 +491,7 @@ else:
     ]
     editable = editable[show_cols].sort_values(["start_date","client_name"], na_position="last")
 
-    st.caption("Tip: Select rows below and use the **Bulk update** box to update all selected at once.")
+    st.caption("Tip: Select rows and use **Bulk update** to move many to Follow-up.")
 
     try:
         edited = st.data_editor(
@@ -570,30 +549,45 @@ else:
             apply_bulk = st.button("Apply to selected", disabled=not selection_supported)
 
         if not selection_supported:
-            st.caption("Multi-row selection not supported in this Streamlit build; edit rows below, then click **Save row-by-row edits**.")
+            st.caption("Multi-row selection not supported; edit rows then click **Save row-by-row edits**.")
         elif apply_bulk:
             if not sel:
                 st.warning("No rows selected.")
             else:
-                for r_idx in sel:
-                    r = edited.iloc[r_idx]
-                    bdate = None
-                    if bulk_status == "confirmed":
-                        if not bulk_date:
-                            continue
-                        bdate = pd.to_datetime(bulk_date).date().isoformat()
-                    upsert_status(r["itinerary_id"], bulk_status, bdate, bulk_adv, assigned_to=bulk_assignee if bulk_status=="followup" else None)
-                st.success(f"Applied to {len(sel)} row(s).")
-                st.rerun()
+                if bulk_status == "followup" and not bulk_assignee:
+                    st.warning("Choose **Assign To** when moving to Follow-up.")
+                else:
+                    for r_idx in sel:
+                        r = edited.iloc[r_idx]
+                        bdate = None
+                        if bulk_status == "confirmed":
+                            if not bulk_date:
+                                continue
+                            bdate = pd.to_datetime(bulk_date).date().isoformat()
+                        upsert_status(
+                            r["itinerary_id"],
+                            bulk_status,
+                            bdate,
+                            bulk_adv,
+                            assigned_to=bulk_assignee if bulk_status == "followup" else None
+                        )
+                    st.success(f"Applied to {len(sel)} row(s).")
+                    st.rerun()
 
+    # Save row-by-row
     if st.button("💾 Save row-by-row edits"):
         saved, errors = 0, 0
         for _, r in edited.iterrows():
             itinerary_id = r["itinerary_id"]
             status = r["status"]
-            assignee = r.get("assigned_to")
+            assignee = (r.get("assigned_to") or "").strip()
             bdate = r.get("booking_date")
             adv   = r.get("advance_amount", 0)
+
+            # guardrails
+            if status == "followup" and not assignee:
+                errors += 1
+                continue
             if status == "confirmed":
                 if bdate is None or (isinstance(bdate, str) and not bdate):
                     errors += 1
@@ -601,17 +595,22 @@ else:
                 bdate = pd.to_datetime(bdate).date().isoformat()
             else:
                 bdate = None
+
             try:
-                upsert_status(itinerary_id, status, bdate, adv, assigned_to=assignee if status=="followup" else None)
+                upsert_status(
+                    itinerary_id, status, bdate, adv,
+                    assigned_to=assignee if status == "followup" else None
+                )
                 saved += 1
             except Exception:
                 errors += 1
         if saved:
             st.success(f"Saved {saved} update(s).")
         if errors:
-            st.warning(f"{errors} row(s) skipped (missing/invalid booking date for confirmed).")
+            st.warning(f"{errors} row(s) skipped (missing assignee for follow-up or booking date for confirmed).")
         st.rerun()
 
+    # (Latest view) history block still available
     if view_mode == "Latest per client (by mobile)":
         st.markdown("### Client-wise history")
         latest = group_latest_by_mobile(df)
@@ -749,7 +748,6 @@ else:
 
         est_doc = get_estimates(chosen_id)
         estimates = est_doc.get("estimates", {})
-        _ = bool(est_doc.get("estimates_locked", False))  # kept for future use
 
         with st.form("vendor_pay_form", clear_on_submit=False):
             c_cat = st.selectbox("Category", ["Hotel","Car","Bhasmarathi","Poojan","PhotoFrame"], index=0, disabled=final_done)
@@ -781,7 +779,7 @@ else:
                 "adv1_amt": _to_int(adv1_amt),
                 "adv1_date": adv1_date.isoformat() if adv1_date else None,
                 "adv2_amt": _to_int(adv2_amt),
-                "adv2_date": _to_int(adv2_date) and adv2_date.isoformat() if adv2_date else None,
+                "adv2_date": adv2_date.isoformat() if adv2_date else None,
                 "final_amt": _to_int(final_amt),
                 "final_date": final_date.isoformat() if final_date else None,
                 "balance": _to_int(bal),
