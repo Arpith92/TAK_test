@@ -110,10 +110,10 @@ if dates_series.isna().all():
     st.error("❌ No valid dates found in the uploaded file.")
     st.stop()
 
-today = datetime.date.today()
-if (dates_series < today).any():
-    st.error("❌ Travel dates are in the past.")
-    st.stop()
+#today = datetime.date.today()
+#if (dates_series < today).any():
+#    st.error("❌ Travel dates are in the past.")
+#    st.stop()
 
 # -----------------------------
 # Load static Excel files
