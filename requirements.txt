@@ -1,0 +1,17 @@
+streamlit==1.42.0
+pandas==2.2.2
+numpy==1.26.4
+openpyxl==3.1.2
+requests==2.31.0
+pymongo[srv]==4.6.3
+dnspython==2.4.2
+streamlit-calendar==1.4.0
+plotly==5.22.0
+reportlab==3.6.13
+python-docx==1.1.0
+pyperclip==1.8.2
+matplotlib==3.8.4
+markdown-it-py==3.0.0
+mdurl==0.1.2
+pygments==2.19.2
+# rebuild
