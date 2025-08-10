@@ -310,6 +310,22 @@ def save_vendor_pay(itinerary_id: str, items: list[dict], final_done: bool):
     doc = _clean_for_mongo(doc)
     col_vendorpay.update_one({"itinerary_id": str(itinerary_id)}, {"$set": doc}, upsert=True)
 
+def push_back_status(itinerary_id: str, new_status: str = "under_discussion"):
+    """
+    Move a confirmed package back to the sales pipeline.
+    Clears booking/incentive so it reappears in Section 1 for edits.
+    """
+    doc = {
+        "status": new_status,          # "under_discussion" or "pending"
+        "assigned_to": None,
+        "booking_date": None,
+        "advance_amount": 0,
+        "incentive": 0,
+        "rep_name": "",
+        "updated_at": datetime.utcnow(),
+    }
+    col_updates.update_one({"itinerary_id": str(itinerary_id)}, {"$set": doc}, upsert=True)
+
 def upsert_status(itinerary_id, status, booking_date, advance_amount, assigned_to=None):
     # compute incentive if confirming
     incentive = 0
@@ -656,6 +672,23 @@ else:
         row = confirmed[confirmed["itinerary_id"] == chosen_id].iloc[0]
         client_name  = row.get("client_name","")
         booking_date = row.get("booking_date","")
+
+                # --- Admin: push a confirmed package back to "Update Status" ---
+        st.markdown("#### ↩️ Admin: Push back to Update Status")
+        st.caption("Send this package back to the pipeline so it reappears in Section 1 for editing.")
+        colpb1, colpb2 = st.columns([2,1])
+        with colpb1:
+            revert_to = st.selectbox("Set status to", ["under_discussion", "pending"], index=0,
+                                     help="Choose where it should appear in Section 1.")
+        with colpb2:
+            if st.button("Push back now", help="Move out of Confirmed and clear booking/incentive."):
+                try:
+                    push_back_status(chosen_id, revert_to)
+                    st.success(f"Moved to **{revert_to}**. It will now show in Section 1 → Update Status.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not push back: {e}")
+
 
         st.markdown("#### Expense Estimates (edit once)")
         est_doc = get_estimates(chosen_id)
