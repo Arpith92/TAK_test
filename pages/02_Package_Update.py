@@ -27,16 +27,23 @@ except Exception:
     CALENDAR_AVAILABLE = False
 
 # ----------------------------
-# Admin gate for THIS page
-# ----------------------------
-ADMIN_PASS_DEFAULT = "Arpith&92--"  # requested
-ADMIN_PASS = st.secrets.get("admin_pass", ADMIN_PASS_DEFAULT)
+# --- Admin gate (replace your current block with this) ---
+ADMIN_PASS_DEFAULT = "Arpith&92--"          # your default
+ADMIN_PASS = str(st.secrets.get("admin_pass", ADMIN_PASS_DEFAULT))
 
 with st.sidebar:
     st.markdown("### Admin access")
-    p = st.text_input("Enter admin password", type="password", key="__admin__")
-    if p != ADMIN_PASS:
-        st.stop()
+    p = st.text_input(
+        "Enter admin password",
+        type="password",
+        placeholder="e.g., Arpith&92--  (ends with two dashes)"
+    )
+
+# trim whitespace to avoid invisible copy/paste issues
+if (p or "").strip() != ADMIN_PASS.strip():
+    st.stop()
+# ---------------------------------------------------------
+
 
 # ----------------------------
 # Fallback loader for users (kept in case you want to extend later)
