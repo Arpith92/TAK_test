@@ -1,6 +1,7 @@
 # pages/02_Package_Update.py
 import math
 import io
+import sys
 import requests
 import pandas as pd
 import streamlit as st
@@ -30,7 +31,6 @@ col_vendorpay     = db["vendor_payments"]   # granular vendor payments per packa
 # ----------------------------
 # External Vendor Master (GitHub)
 # ----------------------------
-# TODO: set this to your vendor master Excel in GitHub
 VENDOR_MASTER_URL = "https://raw.githubusercontent.com/Arpith92/TAK-Project/main/Vendor_Master.xlsx"
 VENDOR_SHEETS = {
     "Car": "Car",
@@ -55,12 +55,10 @@ COMPANY = {
 # Helpers (BSON-safe conversions)
 # ----------------------------
 def _to_dt_or_none(x):
-    """Accepts date/str/pandas types; returns datetime or None."""
     if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
         return None
     try:
         ts = pd.to_datetime(x)
-        # pandas -> python
         if isinstance(ts, pd.Timestamp):
             ts = ts.to_pydatetime()
         if isinstance(ts, datetime):
@@ -81,7 +79,6 @@ def _to_int(x, default=0):
         return default
 
 def _clean_for_mongo(obj):
-    """Recursively convert dict/list scalars to Mongo-safe types."""
     if obj is None:
         return None
     if isinstance(obj, (str, int, float, bool, bytes)):
@@ -96,7 +93,6 @@ def _clean_for_mongo(obj):
         return {str(k): _clean_for_mongo(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
         return [_clean_for_mongo(v) for v in obj]
-    # pandas / numpy scalars
     try:
         import numpy as np
         if isinstance(obj, (np.integer,)):
@@ -130,20 +126,17 @@ def get_vendor_list(category: str) -> list[str]:
     if df is None or "Vendor" not in df.columns:
         return []
     vals = sorted([str(v).strip() for v in df["Vendor"].dropna().unique() if str(v).strip()])
-    # inject "Create new..."
     return vals + ["Create new..."]
 
 def to_int_money(x):
     return _to_int(x, 0)
 
 def current_fy_two_digits(today: date | None = None) -> int:
-    """Financial year (India style): Apr–Mar. Return last two digits (e.g., 25)."""
     d = today or date.today()
     year = d.year if d.month >= 4 else d.year - 1
     return year % 100
 
 def next_ach_id(fy_2d: int) -> str:
-    """Find next sequence for ACH-<fy>-NNN based on existing docs with ach_id."""
     prefix = f"ACH-{fy_2d:02d}-"
     docs = col_itineraries.find({"ach_id": {"$regex": f"^{prefix}\\d{{3}}$"}}, {"ach_id": 1})
     max_no = 0
@@ -157,7 +150,6 @@ def next_ach_id(fy_2d: int) -> str:
     return f"{prefix}{max_no+1:03d}"
 
 def backfill_ach_ids():
-    """Give ACH IDs to itineraries that don't have one yet (one-time per doc)."""
     fy = current_fy_two_digits()
     cursor = col_itineraries.find({"$or": [{"ach_id": {"$exists": False}}, {"ach_id": ""}]})
     for doc in cursor:
@@ -172,7 +164,6 @@ def fetch_itineraries_df():
     for r in rows:
         r["itinerary_id"] = str(r.get("_id"))
         r["ach_id"] = r.get("ach_id", "")
-        # normalize dates
         for k in ("start_date", "end_date", "upload_date"):
             try:
                 v = r.get(k)
@@ -180,7 +171,6 @@ def fetch_itineraries_df():
             except Exception:
                 r[k] = None
         r["package_cost_num"] = to_int_money(r.get("package_cost"))
-        # guards
         r["client_mobile"] = r.get("client_mobile", "")
         r["client_name"] = r.get("client_name", "")
         r["representative"] = r.get("representative", "")
@@ -206,7 +196,6 @@ def fetch_expenses_df():
     return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["itinerary_id","total_expenses","profit","package_cost"])
 
 def find_itinerary_doc(selected_id: str):
-    """Fetch itinerary doc by _id (ObjectId), or fallback to string fields."""
     it = None
     try:
         it = col_itineraries.find_one({"_id": ObjectId(selected_id)})
@@ -226,14 +215,12 @@ def to_date_or_none(x):
         return None
 
 def group_latest_by_mobile(df_all: pd.DataFrame) -> pd.DataFrame:
-    """Return latest package per unique client_mobile, with history ids list."""
     if df_all.empty:
         return df_all
     df_all = df_all.copy()
     df_all["upload_date"] = pd.to_datetime(df_all["upload_date"])
     df_all.sort_values(["client_mobile","upload_date"], ascending=[True, False], inplace=True)
     latest_rows = df_all.groupby("client_mobile", as_index=False).first()
-    # attach history list (excluding latest)
     hist_map = {}
     for mob, grp in df_all.groupby("client_mobile"):
         ids = grp["itinerary_id"].tolist()
@@ -274,13 +261,11 @@ def save_vendor_pay(itinerary_id: str, items: list[dict], final_done: bool):
     col_vendorpay.update_one({"itinerary_id": str(itinerary_id)}, {"$set": doc}, upsert=True)
 
 def upsert_status(itinerary_id, status, booking_date, advance_amount, assigned_to=None):
-    # compute incentive if confirming
     incentive = 0
     rep_name = ""
     if status == "confirmed":
         it = find_itinerary_doc(itinerary_id)
         rep_name = (it or {}).get("representative", "")
-        # prefer expenses.package_cost else itinerary.package_cost
         exp = col_expenses.find_one({"itinerary_id": str(itinerary_id)}, {"package_cost":1})
         if exp and "package_cost" in exp:
             pkg_amt = _to_int(exp["package_cost"])
@@ -308,14 +293,8 @@ def upsert_status(itinerary_id, status, booking_date, advance_amount, assigned_t
     col_updates.update_one({"itinerary_id": str(itinerary_id)}, {"$set": _clean_for_mongo(doc)}, upsert=True)
 
 def save_expense_summary(itinerary_id: str, client_name: str, booking_date, package_cost: int, notes: str = ""):
-    """
-    Save package summary with package_cost and totals from vendor payments.
-    Profit = package_cost - sum(vendor payments (adv1+adv2+final) or finalization cost?).
-    We'll consider the committed finalization costs as expenses baseline.
-    """
     vp = get_vendor_pay_doc(itinerary_id)
     items = vp.get("items", [])
-    # Use finalization_cost as the committed cost baseline. If absent, use sum of payments.
     total_expenses = 0
     for it in items:
         fc = _to_int(it.get("finalization_cost", 0))
@@ -341,16 +320,20 @@ def save_expense_summary(itinerary_id: str, client_name: str, booking_date, pack
     return profit, total_expenses
 
 # ----------------------------
-# PDFs (ReportLab)
-
-# ---- PDF generation availability (place this above the "PDFs (ReportLab)" section) ----
-PDF_AVAILABLE = True
+# PDFs (ReportLab) – soft dependency
+# ----------------------------
+PDF_AVAILABLE = False
+PDF_ERROR = ""
 try:
+    # ReportLab wheels usually unavailable on Python 3.13 at the moment.
+    if sys.version_info >= (3, 13):
+        raise RuntimeError("ReportLab not supported on Python 3.13 in this environment")
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     from reportlab.lib.units import cm
-except Exception:
-    PDF_AVAILABLE = False
+    PDF_AVAILABLE = True
+except Exception as _e:
+    PDF_ERROR = str(_e)
 
 def _pdf_header(c, title):
     c.setFont("Helvetica-Bold", 14)
@@ -394,7 +377,6 @@ def gen_invoice_pdf(it_doc: dict, exp_doc: dict, estimates: dict) -> bytes:
     c = canvas.Canvas(buf, pagesize=A4)
     _pdf_header(c, "TAX INVOICE")
 
-    # Header block
     y = 25.5*cm
     c.setFont("Helvetica", 10)
     c.drawString(2*cm, y, f"Invoice #: {it_doc.get('ach_id','')}")
@@ -407,7 +389,6 @@ def gen_invoice_pdf(it_doc: dict, exp_doc: dict, estimates: dict) -> bytes:
     c.drawString(2*cm, y, f"Subject: {route} for {pax} Persons")
     y -= 1.0*cm
 
-    # Items from estimates (only services taken)
     c.setFont("Helvetica-Bold", 10)
     c.drawString(2*cm, y, "Item & Description")
     c.drawRightString(18*cm, y, "Amount (₹)")
@@ -471,7 +452,7 @@ if "advance_amount" not in df.columns:
     df["advance_amount"] = 0
 df["advance_amount"] = pd.to_numeric(df["advance_amount"], errors="coerce").fillna(0).astype(int)
 
-# Normalize date columns to avoid NaT in editor
+# Normalize date columns
 for col_ in ["start_date", "end_date", "booking_date"]:
     if col_ in df.columns:
         df[col_] = df[col_].apply(to_date_or_none)
@@ -498,7 +479,7 @@ k4.metric("🔴 Cancelled", int(cancelled_count))
 st.divider()
 
 # ----------------------------
-# 1) Status Update (Latest per client + history)
+# 1) Status Update
 # ----------------------------
 st.subheader("1) Update Status")
 view_mode = st.radio("View mode", ["Latest per client (by mobile)", "All packages"], horizontal=True)
@@ -522,7 +503,6 @@ else:
         if c not in editable.columns:
             editable[c] = None
 
-    # normalize dtypes
     for c in ["ach_id","itinerary_id","client_name","final_route","package_cost","client_mobile"]:
         editable[c] = editable[c].astype(str).fillna("")
     editable["total_pax"] = pd.to_numeric(editable["total_pax"], errors="coerce").fillna(0).astype(int)
@@ -538,7 +518,6 @@ else:
 
     st.caption("Tip: Select rows below and use the **Bulk update** box to update all selected at once.")
 
-    # Data editor with status + assigned_to + followup
     try:
         edited = st.data_editor(
             editable,
@@ -637,7 +616,6 @@ else:
             st.warning(f"{errors} row(s) skipped (missing/invalid booking date for confirmed).")
         st.rerun()
 
-    # Show history per client (Latest view only)
     if view_mode == "Latest per client (by mobile)":
         st.markdown("### Client-wise history")
         latest = group_latest_by_mobile(df)
@@ -657,7 +635,7 @@ else:
 st.divider()
 
 # ----------------------------
-# 2) Expenses (Summary) & Vendor Payments (Confirmed Only)
+# 2) Expenses & Vendor Payments (Confirmed Only)
 # ----------------------------
 st.subheader("2) Expenses & Vendor Payments (Confirmed Only)")
 
@@ -711,7 +689,6 @@ else:
         client_name  = row.get("client_name","")
         booking_date = row.get("booking_date","")
 
-        # ---------- Expense Estimates (edit once, vendor from master) ----------
         st.markdown("#### Expense Estimates (edit once)")
         est_doc = get_estimates(chosen_id)
         locked = bool(est_doc.get("estimates_locked", False))
@@ -731,18 +708,15 @@ else:
                 with cols[i]:
                     st.caption(cat)
                     vendors = get_vendor_list(cat)
-                    # Pre-select current
                     cur_vendor = estimates.get(cat,{}).get("vendor","")
-                    idx = 0
-                    if cur_vendor and cur_vendor in vendors:
-                        idx = vendors.index(cur_vendor)
-                    sel = st.selectbox(f"{cat} Vendor", vendors, index=idx if vendors else 0,
-                                       key=f"est_v_{cat}", disabled=locked)
-                    if sel == "Create new...":
+                    idx = vendors.index(cur_vendor) if (cur_vendor and cur_vendor in vendors) else 0
+                    selv = st.selectbox(f"{cat} Vendor", vendors, index=idx if vendors else 0,
+                                        key=f"est_v_{cat}", disabled=locked)
+                    if selv == "Create new...":
                         new_names[cat] = st.text_input(f"New {cat} Vendor", value=cur_vendor, disabled=locked)
                         vname = (new_names[cat] or "").strip()
                     else:
-                        vname = sel or ""
+                        vname = selv or ""
                     amt = st.number_input(f"{cat} Estimate (₹)", min_value=0, step=100,
                                           value=_to_int(estimates.get(cat,{}).get("amount",0)),
                                           disabled=locked, key=f"est_a_{cat}")
@@ -755,7 +729,6 @@ else:
             st.success("Estimates saved.")
             st.rerun()
 
-        # ---------- Package Summary (package cost + computed totals) ----------
         st.markdown("#### Package Summary")
         base_cost = st.number_input(
             "Package cost (₹) — final cost for invoice",
@@ -771,7 +744,6 @@ else:
 
         st.markdown("---")
 
-        # ---------- Vendor payment tracking ----------
         st.markdown("### Vendor Payments")
         vp_doc = get_vendor_pay_doc(chosen_id)
         items = vp_doc.get("items", [])
@@ -779,7 +751,6 @@ else:
 
         st.caption("Update vendor-wise payments. Vendor is taken from Estimates. Mark **Final done** to lock further edits.")
 
-        # Estimates drive vendor selection (read-only here)
         est_doc = get_estimates(chosen_id)
         estimates = est_doc.get("estimates", {})
         est_locked = bool(est_doc.get("estimates_locked", False))
@@ -819,7 +790,6 @@ else:
                 "final_date": final_date.isoformat() if final_date else None,
                 "balance": _to_int(bal),
             }
-            # upsert by category+vendor
             updated = False
             for i, it in enumerate(items):
                 if it.get("category")==c_cat and it.get("vendor")==vname:
@@ -832,7 +802,6 @@ else:
             st.success("Vendor payment saved.")
             st.rerun()
 
-        # show current vendor payments
         if items:
             show = pd.DataFrame(items)
             st.dataframe(show, use_container_width=True)
@@ -841,39 +810,52 @@ else:
 
         st.markdown("---")
 
-        # ---------- Documents (PDF) ----------
-        # ---------- Documents (PDF) ----------
-st.markdown("### Documents")
-d1, d2 = st.columns(2)
-it_doc = find_itinerary_doc(chosen_id) or {}
-upd_doc = col_updates.find_one({"itinerary_id": str(chosen_id)}, {"_id":0}) or {}
-exp_doc = col_expenses.find_one({"itinerary_id": str(chosen_id)}, {"_id":0}) or {}
-est_doc = get_estimates(chosen_id)
-estimates = est_doc.get("estimates", {})
+        # ----------------------------
+        # Documents (PDF) – now safely inside chosen_id
+        # ----------------------------
+        st.markdown("### Documents")
+        d1, d2 = st.columns(2)
+        it_doc = find_itinerary_doc(chosen_id) or {}
+        upd_doc = col_updates.find_one({"itinerary_id": str(chosen_id)}, {"_id":0}) or {}
+        exp_doc = col_expenses.find_one({"itinerary_id": str(chosen_id)}, {"_id":0}) or {}
+        est_doc = get_estimates(chosen_id)
+        estimates = est_doc.get("estimates", {})
 
-if PDF_AVAILABLE:
-    # use the PDF generators you already defined (gen_payment_slip_pdf / gen_invoice_pdf)
-    pslip = gen_payment_slip_pdf(it_doc, upd_doc)
-    with d1:
-        st.download_button("⬇️ Download Payment Slip (PDF)",
-                           data=pslip,
-                           file_name=f"{it_doc.get('ach_id','')}_payment_slip.pdf",
-                           mime="application/pdf")
-    inv = gen_invoice_pdf(it_doc, exp_doc, estimates)
-    with d2:
-        st.download_button("⬇️ Download Invoice (PDF)",
-                           data=inv,
-                           file_name=f"{it_doc.get('ach_id','')}_invoice.pdf",
-                           mime="application/pdf")
-else:
-    # graceful fallback + instruction
-    with d1:
-        st.info("PDF generator unavailable. Install `reportlab` to enable PDF downloads.")
-    with d2:
-        st.caption("Add to requirements.txt:  \n`reportlab==3.6.13`  \nThen redeploy.")
+        if PDF_AVAILABLE:
+            try:
+                pslip = gen_payment_slip_pdf(it_doc, upd_doc)
+                with d1:
+                    st.download_button("⬇️ Download Payment Slip (PDF)",
+                                       data=pslip,
+                                       file_name=f"{it_doc.get('ach_id','')}_payment_slip.pdf",
+                                       mime="application/pdf")
+                inv = gen_invoice_pdf(it_doc, exp_doc, estimates)
+                with d2:
+                    st.download_button("⬇️ Download Invoice (PDF)",
+                                       data=inv,
+                                       file_name=f"{it_doc.get('ach_id','')}_invoice.pdf",
+                                       mime="application/pdf")
+            except Exception as e:
+                with d1:
+                    st.info("PDF generator encountered an error and is disabled for this session.")
+                with d2:
+                    st.caption(f"Details: {e}")
+        else:
+            with d1:
+                st.info("PDF generator unavailable. Install `reportlab` to enable PDF downloads.")
+            with d2:
+                if sys.version_info >= (3,13):
+                    st.caption(
+                        "You're on Python 3.13. To enable PDFs:\n"
+                        "1) Add `runtime.txt` with `3.12`\n"
+                        "2) Add `reportlab==3.6.13` to `requirements.txt`\n"
+                        "3) Redeploy."
+                    )
+                else:
+                    st.caption("Add to requirements.txt:\n`reportlab==3.6.13`\nThen redeploy.")
 
 # ----------------------------
-# 3) Calendar – Toggle views & click-to-open details
+# 3) Calendar – Confirmed Packages
 # ----------------------------
 st.subheader("3) Calendar – Confirmed Packages")
 view = st.radio("View", ["By Booking Date", "By Travel Dates"], horizontal=True)
@@ -895,7 +877,6 @@ else:
             if pd.isna(r.get("start_date")) or pd.isna(r.get("end_date")):
                 continue
             ev["start"] = pd.to_datetime(r["start_date"]).strftime("%Y-%m-%d")
-            # FullCalendar exclusive end
             end_ = pd.to_datetime(r["end_date"]) + pd.Timedelta(days=1)
             ev["end"] = end_.strftime("%Y-%m-%d")
 
