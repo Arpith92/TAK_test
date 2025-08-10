@@ -1,13 +1,23 @@
 # pages/02_Package_Update.py
-import math
+from __future__ import annotations
+
 import io
+import math
 import sys
-import requests
-import pandas as pd
-import streamlit as st
-from pymongo import MongoClient
 from datetime import datetime, date, time as dtime
+from typing import Optional
+
+import pandas as pd
+import requests
+import streamlit as st
 from bson import ObjectId
+from pymongo import MongoClient
+
+# ----------------------------
+# Page config
+# ----------------------------
+st.set_page_config(page_title="Package Update", layout="wide")
+st.title("📦 Package Update")
 
 # Optional: pretty calendar
 CALENDAR_AVAILABLE = True
@@ -17,16 +27,126 @@ except Exception:
     CALENDAR_AVAILABLE = False
 
 # ----------------------------
-# MongoDB Setup
+# Fallback loader for users (if Cloud Secrets miss [users])
 # ----------------------------
-MONGO_URI = st.secrets["mongo_uri"]
-client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
-db = client["TAK_DB"]
+def load_users() -> dict:
+    """
+    1) Prefer Cloud Secrets: st.secrets["users"]
+    2) Fallback to repo file: .streamlit/secrets.toml (table [users])
+    Returns {} if none found.
+    """
+    users = st.secrets.get("users", None)
+    if isinstance(users, dict) and users:
+        return users
 
-col_itineraries   = db["itineraries"]       # created by main app
-col_updates       = db["package_updates"]   # status + booking_date + advance_amount + assignee + incentive
-col_expenses      = db["expenses"]          # package summary (cost, totals, profit) + estimates (locked)
-col_vendorpay     = db["vendor_payments"]   # granular vendor payments per package
+    # Try reading the repo's .streamlit/secrets.toml (for local/dev or fallback)
+    try:
+        try:
+            import tomllib  # Python 3.11+
+        except Exception:  # pragma: no cover
+            import tomli as tomllib  # older pythons
+
+        with open(".streamlit/secrets.toml", "rb") as f:
+            data = tomllib.load(f)
+        u = data.get("users", {})
+        if isinstance(u, dict) and u:
+            with st.sidebar:
+                st.warning(
+                    "Using users from repo .streamlit/secrets.toml. "
+                    "For production, set them in Manage app → Secrets."
+                )
+            return u
+    except Exception:
+        pass
+    return {}
+
+# ----------------------------
+# Enforced PIN login (+ Logout)
+# ----------------------------
+def _login() -> Optional[str]:
+    """
+    Enforce PIN login. Uses load_users() so it works even if Cloud secrets were
+    not saved correctly. Shows a helpful hint if misconfigured.
+    """
+    # Logout button
+    with st.sidebar:
+        if st.session_state.get("user"):
+            st.markdown(f"**Signed in as:** {st.session_state['user']}")
+            if st.button("Log out"):
+                st.session_state.pop("user", None)
+                st.rerun()
+
+    if st.session_state.get("user"):
+        return st.session_state["user"]
+
+    users_map = load_users()
+
+    # If still missing, show helpful hint + secrets keys.
+    if not isinstance(users_map, dict) or not users_map:
+        with st.sidebar:
+            st.caption("Secrets debug")
+            try:
+                st.write("keys:", list(st.secrets.keys()))
+            except Exception:
+                st.write("keys: unavailable")
+            st.write("users type:", type(st.secrets.get("users", None)).__name__)
+        st.error(
+            "Login is not configured yet.\n\n"
+            "Go to **Manage app → Secrets** and add (single-line URI, then a blank line, "
+            "then the users table):\n\n"
+            'mongo_uri = "mongodb+srv://…"\n\n'
+            "[users]\nArpith = \"1234\"\nReena  = \"5678\"\nTeena  = \"7777\"\nKuldeep = \"8888\"\n"
+        )
+        st.stop()
+
+    st.markdown("### 🔐 Login")
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        name = st.selectbox("User", list(users_map.keys()), key="login_user")
+    with c2:
+        pin = st.text_input("PIN", type="password", key="login_pin")
+
+    if st.button("Sign in"):
+        if str(users_map.get(name, "")).strip() == str(pin).strip():
+            st.session_state["user"] = name
+            st.success(f"Welcome, {name}!")
+            st.rerun()
+        else:
+            st.error("Invalid PIN")
+            st.stop()
+
+    return None
+
+# Gate the page until logged in
+user = _login()
+if not user:
+    st.stop()
+
+# ----------------------------
+# MongoDB Setup (with helpful errors)
+# ----------------------------
+try:
+    MONGO_URI = st.secrets["mongo_uri"]
+except KeyError:
+    st.error(
+        "❌ MongoDB is not configured.\n\n"
+        "In **Manage app → Secrets**, add:\n"
+        'mongo_uri = "mongodb+srv://USERNAME:PASSWORD@CLUSTER/?retryWrites=true&w=majority"\n'
+    )
+    st.stop()
+
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
+    client.admin.command("ping")
+except Exception as e:
+    st.error(f"❌ Could not connect to MongoDB. Details: {e}")
+    st.stop()
+
+db = client["TAK_DB"]
+col_itineraries = db["itineraries"]
+col_updates     = db["package_updates"]
+col_expenses    = db["expenses"]
+col_vendorpay   = db["vendor_payments"]
 
 # ----------------------------
 # External Vendor Master (GitHub)
@@ -38,17 +158,6 @@ VENDOR_SHEETS = {
     "Bhasmarathi": "Bhasmarathi",
     "Poojan": "Poojan",
     "PhotoFrame": "PhotoFrame",
-}
-
-# ----------------------------
-# Company (PDF header)
-# ----------------------------
-COMPANY = {
-    "name": "ACHALA HOLIDAYS PVT LTD",
-    "addr1": "Ground Floor, 77, Dewas Road",
-    "addr2": "Ujjain, Madhya Pradesh 456010",
-    "email": "travelaajkal@gmail.com",
-    "web": "www.travelaajkal.com",
 }
 
 # ----------------------------
@@ -320,121 +429,8 @@ def save_expense_summary(itinerary_id: str, client_name: str, booking_date, pack
     return profit, total_expenses
 
 # ----------------------------
-# PDFs (ReportLab) – soft dependency
+# Load & Prep data
 # ----------------------------
-PDF_AVAILABLE = False
-PDF_ERROR = ""
-try:
-    # ReportLab wheels usually unavailable on Python 3.13 at the moment.
-    if sys.version_info >= (3, 13):
-        raise RuntimeError("ReportLab not supported on Python 3.13 in this environment")
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.units import cm
-    PDF_AVAILABLE = True
-except Exception as _e:
-    PDF_ERROR = str(_e)
-
-def _pdf_header(c, title):
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(2*cm, 28*cm, COMPANY["name"])
-    c.setFont("Helvetica", 9)
-    c.drawString(2*cm, 27.4*cm, COMPANY["addr1"])
-    c.drawString(2*cm, 27.0*cm, COMPANY["addr2"])
-    c.drawString(2*cm, 26.6*cm, f'{COMPANY["email"]} | {COMPANY["web"]}')
-    c.setFont("Helvetica-Bold", 16)
-    c.drawRightString(19*cm, 28*cm, title)
-    c.line(2*cm, 26.3*cm, 19*cm, 26.3*cm)
-
-def gen_payment_slip_pdf(it_doc: dict, upd_doc: dict) -> bytes:
-    from io import BytesIO
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    _pdf_header(c, "PAYMENT RECEIPT")
-
-    y = 25.5*cm
-    c.setFont("Helvetica", 10)
-    c.drawString(2*cm, y, f"ACH ID: {it_doc.get('ach_id','')}")
-    y -= 0.6*cm
-    c.drawString(2*cm, y, f"Client: {it_doc.get('client_name','')}")
-    y -= 0.6*cm
-    amt = _to_int((upd_doc or {}).get("advance_amount", 0))
-    c.drawString(2*cm, y, f"Amount Received: ₹{amt:,}")
-    y -= 0.6*cm
-    bdate = (upd_doc or {}).get("booking_date","")
-    c.drawString(2*cm, y, f"Payment Date: {bdate}")
-    y -= 1.2*cm
-
-    c.setFont("Helvetica-Oblique", 9)
-    c.drawString(2*cm, y, "Thank you for your payment.")
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-def gen_invoice_pdf(it_doc: dict, exp_doc: dict, estimates: dict) -> bytes:
-    from io import BytesIO
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    _pdf_header(c, "TAX INVOICE")
-
-    y = 25.5*cm
-    c.setFont("Helvetica", 10)
-    c.drawString(2*cm, y, f"Invoice #: {it_doc.get('ach_id','')}")
-    c.drawRightString(19*cm, y, f"Invoice Date: {datetime.today().date().isoformat()}")
-    y -= 0.6*cm
-    c.drawString(2*cm, y, f"Bill To: {it_doc.get('client_name','')}")
-    y -= 0.6*cm
-    route = it_doc.get("final_route","")
-    pax = it_doc.get("total_pax","")
-    c.drawString(2*cm, y, f"Subject: {route} for {pax} Persons")
-    y -= 1.0*cm
-
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(2*cm, y, "Item & Description")
-    c.drawRightString(18*cm, y, "Amount (₹)")
-    y -= 0.4*cm
-    c.line(2*cm, y, 19*cm, y)
-    y -= 0.4*cm
-    c.setFont("Helvetica", 10)
-
-    lines = []
-    est = estimates or {}
-    if _to_int((est.get("Car") or {}).get("amount",0)) > 0:
-        lines.append(("Car Hire", _to_int(est["Car"]["amount"])))
-    if _to_int((est.get("Hotel") or {}).get("amount",0)) > 0:
-        lines.append(("Hotel", _to_int(est["Hotel"]["amount"])))
-    if _to_int((est.get("Bhasmarathi") or {}).get("amount",0)) > 0:
-        lines.append(("Bhasmarathi Tickets", _to_int(est["Bhasmarathi"]["amount"])))
-    if _to_int((est.get("Poojan") or {}).get("amount",0)) > 0:
-        lines.append(("Poojan Services", _to_int(est["Poojan"]["amount"])))
-    if _to_int((est.get("PhotoFrame") or {}).get("amount",0)) > 0:
-        lines.append(("Photo Frame", _to_int(est["PhotoFrame"]["amount"])))
-
-    subtotal = 0
-    for desc, amt in lines:
-        c.drawString(2*cm, y, f"• {desc}")
-        c.drawRightString(18*cm, y, f"{amt:,}")
-        y -= 0.5*cm
-        subtotal += amt
-
-    y -= 0.3*cm
-    c.line(2*cm, y, 19*cm, y)
-    y -= 0.5*cm
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(2*cm, y, "Total (Package Final Cost)")
-    c.drawRightString(18*cm, y, f"{subtotal:,}")
-    y -= 0.7*cm
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-# ----------------------------
-# Page UI
-# ----------------------------
-st.set_page_config(page_title="Package Update", layout="wide")
-st.title("📦 Package Update")
-
 df_it = fetch_itineraries_df()
 if df_it.empty:
     st.info("No packages found yet. Upload a file in the main app first.")
@@ -753,7 +749,7 @@ else:
 
         est_doc = get_estimates(chosen_id)
         estimates = est_doc.get("estimates", {})
-        est_locked = bool(est_doc.get("estimates_locked", False))
+        _ = bool(est_doc.get("estimates_locked", False))  # kept for future use
 
         with st.form("vendor_pay_form", clear_on_submit=False):
             c_cat = st.selectbox("Category", ["Hotel","Car","Bhasmarathi","Poojan","PhotoFrame"], index=0, disabled=final_done)
@@ -785,7 +781,7 @@ else:
                 "adv1_amt": _to_int(adv1_amt),
                 "adv1_date": adv1_date.isoformat() if adv1_date else None,
                 "adv2_amt": _to_int(adv2_amt),
-                "adv2_date": adv2_date.isoformat() if adv2_date else None,
+                "adv2_date": _to_int(adv2_date) and adv2_date.isoformat() if adv2_date else None,
                 "final_amt": _to_int(final_amt),
                 "final_date": final_date.isoformat() if final_date else None,
                 "balance": _to_int(bal),
@@ -808,51 +804,7 @@ else:
         else:
             st.caption("No vendor payments added yet.")
 
-        st.markdown("---")
-
-        # ----------------------------
-        # Documents (PDF) – now safely inside chosen_id
-        # ----------------------------
-        st.markdown("### Documents")
-        d1, d2 = st.columns(2)
-        it_doc = find_itinerary_doc(chosen_id) or {}
-        upd_doc = col_updates.find_one({"itinerary_id": str(chosen_id)}, {"_id":0}) or {}
-        exp_doc = col_expenses.find_one({"itinerary_id": str(chosen_id)}, {"_id":0}) or {}
-        est_doc = get_estimates(chosen_id)
-        estimates = est_doc.get("estimates", {})
-
-        if PDF_AVAILABLE:
-            try:
-                pslip = gen_payment_slip_pdf(it_doc, upd_doc)
-                with d1:
-                    st.download_button("⬇️ Download Payment Slip (PDF)",
-                                       data=pslip,
-                                       file_name=f"{it_doc.get('ach_id','')}_payment_slip.pdf",
-                                       mime="application/pdf")
-                inv = gen_invoice_pdf(it_doc, exp_doc, estimates)
-                with d2:
-                    st.download_button("⬇️ Download Invoice (PDF)",
-                                       data=inv,
-                                       file_name=f"{it_doc.get('ach_id','')}_invoice.pdf",
-                                       mime="application/pdf")
-            except Exception as e:
-                with d1:
-                    st.info("PDF generator encountered an error and is disabled for this session.")
-                with d2:
-                    st.caption(f"Details: {e}")
-        else:
-            with d1:
-                st.info("PDF generator unavailable. Install `reportlab` to enable PDF downloads.")
-            with d2:
-                if sys.version_info >= (3,13):
-                    st.caption(
-                        "You're on Python 3.13. To enable PDFs:\n"
-                        "1) Add `runtime.txt` with `3.12`\n"
-                        "2) Add `reportlab==3.6.13` to `requirements.txt`\n"
-                        "3) Redeploy."
-                    )
-                else:
-                    st.caption("Add to requirements.txt:\n`reportlab==3.6.13`\nThen redeploy.")
+st.divider()
 
 # ----------------------------
 # 3) Calendar – Confirmed Packages
