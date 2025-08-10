@@ -27,22 +27,30 @@ except Exception:
     CALENDAR_AVAILABLE = False
 
 # ----------------------------
-# --- Admin gate (replace your current block with this) ---
-ADMIN_PASS_DEFAULT = "333--"          # your default
-ADMIN_PASS = str(st.secrets.get("admin_pass", ADMIN_PASS_DEFAULT))
+# --- Admin-only gate for THIS page (no PIN login here) ---
+def require_admin():
+    ADMIN_PASS_DEFAULT = "Arpith&92--"  # your admin password
+    ADMIN_PASS = str(st.secrets.get("admin_pass", ADMIN_PASS_DEFAULT))
 
-with st.sidebar:
-    st.markdown("### Admin access")
-    p = st.text_input(
-        "Enter admin password",
-        type="password",
-        placeholder="e.g., Arpith&92--  (ends with two dashes)"
-    )
+    with st.sidebar:
+        st.markdown("### Admin access")
+        p = st.text_input(
+            "Enter admin password",
+            type="password",
+            placeholder="Arpith&92--"
+        )
 
-# trim whitespace to avoid invisible copy/paste issues
-if (p or "").strip() != ADMIN_PASS.strip():
-    st.stop()
-# ---------------------------------------------------------
+    # Trim spaces to avoid copy/paste issues
+    if (p or "").strip() != ADMIN_PASS.strip():
+        st.stop()
+
+    # Force the identity for this page to "Admin" regardless of any previous login
+    st.session_state["user"] = "Admin"
+    st.session_state["is_admin"] = True
+
+require_admin()
+# ----------------------------------------------------------
+
 
 
 # ----------------------------
