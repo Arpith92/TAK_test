@@ -9,27 +9,18 @@ import streamlit as st
 from bson import ObjectId
 from pymongo import MongoClient
 
-
 # ----------------------------
 # Fallback loader for users (if Cloud Secrets miss [users])
 # ----------------------------
 def load_users() -> dict:
-    """
-    1) Prefer Cloud Secrets: st.secrets["users"]
-    2) Fallback to repo file: .streamlit/secrets.toml (table [users])
-    Returns {} if none found.
-    """
     users = st.secrets.get("users", None)
     if isinstance(users, dict) and users:
         return users
-
-    # Try reading the repo's .streamlit/secrets.toml (for local/dev or as fallback)
     try:
         try:
             import tomllib  # Python 3.11+
         except Exception:  # pragma: no cover
             import tomli as tomllib  # older pythons
-
         with open(".streamlit/secrets.toml", "rb") as f:
             data = tomllib.load(f)
         u = data.get("users", {})
@@ -44,16 +35,10 @@ def load_users() -> dict:
         pass
     return {}
 
-
 # ----------------------------
 # Enforced PIN login (+ Logout)
 # ----------------------------
 def _login() -> Optional[str]:
-    """
-    Enforce PIN login. Uses load_users() so it works even if Cloud secrets were
-    not saved correctly. Shows a small debug of secrets keys if misconfigured.
-    """
-    # Logout button
     with st.sidebar:
         if st.session_state.get("user"):
             st.markdown(f"**Signed in as:** {st.session_state['user']}")
@@ -65,8 +50,6 @@ def _login() -> Optional[str]:
         return st.session_state["user"]
 
     users_map = load_users()
-
-    # If still missing, show helpful hint + secrets keys.
     if not isinstance(users_map, dict) or not users_map:
         with st.sidebar:
             st.caption("Secrets debug")
@@ -77,10 +60,9 @@ def _login() -> Optional[str]:
             st.write("users type:", type(st.secrets.get("users", None)).__name__)
         st.error(
             "Login is not configured yet.\n\n"
-            "Go to **Manage app → Secrets** and add (single-line URI, then a blank line, "
-            "then the users table):\n\n"
+            "Add to **Manage app → Secrets**:\n"
             'mongo_uri = "mongodb+srv://…"\n\n'
-            "[users]\nArpith = \"1234\"\nReena  = \"5678\"\nTeena  = \"7777\"\nKuldeep = \"8888\"\n"
+            "[users]\nArpith = \"1234\"\nReena = \"5678\"\nTeena = \"7777\"\nKuldeep = \"8888\"\n"
         )
         st.stop()
 
@@ -98,22 +80,19 @@ def _login() -> Optional[str]:
             st.rerun()
         else:
             st.error("Invalid PIN"); st.stop()
-
     return None
-
 
 # ----------------------------
 # Mongo setup
 # ----------------------------
-# mongo_uri must be in Cloud Secrets (or local .streamlit/secrets.toml)
 MONGO_URI = st.secrets["mongo_uri"]
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
 db = client["TAK_DB"]
 
-col_itineraries = db["itineraries"]     # created by main app
-col_updates     = db["package_updates"] # holds status/booking/incentive
-col_followups   = db["followups"]       # immutable follow-up logs
-
+col_itineraries = db["itineraries"]
+col_updates     = db["package_updates"]
+col_followups   = db["followups"]
+col_expenses    = db["expenses"]  # <— used to read final package cost
 
 # ----------------------------
 # Helpers
@@ -146,15 +125,25 @@ def month_bounds(d: date):
     last = next_month - timedelta(days=1)
     return first, last
 
+def _package_amount_for(iid: str) -> int:
+    """Prefer saved final package_cost from expenses, else itinerary.package_cost."""
+    exp = col_expenses.find_one({"itinerary_id": str(iid)}, {"package_cost": 1}) or {}
+    if "package_cost" in exp:
+        return _to_int(exp.get("package_cost", 0))
+    it = col_itineraries.find_one({"_id": ObjectId(iid)}, {"package_cost": 1}) or {}
+    return _to_int(it.get("package_cost", 0))
+
+def _compute_incentive(pkg_amt: int) -> int:
+    if 5000 < pkg_amt < 20000:
+        return 250
+    if pkg_amt >= 20000:
+        return 500
+    return 0
 
 # ----------------------------
 # Data fetchers
 # ----------------------------
 def fetch_assigned_followups(user: str) -> pd.DataFrame:
-    """
-    Get itineraries with status == 'followup' and assigned_to == user.
-    Merge with itineraries for details.
-    """
     rows = list(col_updates.find(
         {"status": "followup", "assigned_to": user},
         {"_id": 0}
@@ -204,33 +193,44 @@ def fetch_confirmed_incentives(user: str, start_d: date, end_d: date) -> int:
     cur = col_updates.find(q, {"_id": 0, "incentive": 1})
     return sum(_to_int(d.get("incentive", 0)) for d in cur)
 
+def count_confirmed(user: str, start_d: Optional[date]=None, end_d: Optional[date]=None) -> int:
+    q = {"status": "confirmed", "rep_name": user}
+    if start_d and end_d:
+        q["booking_date"] = {
+            "$gte": datetime.combine(start_d, datetime.min.time()),
+            "$lte": datetime.combine(end_d, datetime.max.time())
+        }
+    return col_updates.count_documents(q)
 
 # ----------------------------
 # Updaters
 # ----------------------------
-def upsert_update_status(iid: str, status: str, user: str,
-                         next_followup_on: Optional[date],
-                         booking_date: Optional[date],
-                         comment: str,
-                         cancellation_reason: Optional[str],
-                         advance_amount: Optional[int]) -> None:
+def upsert_update_status(
+    iid: str,
+    status: str,
+    user: str,
+    next_followup_on: Optional[date],
+    booking_date: Optional[date],
+    comment: str,
+    cancellation_reason: Optional[str],
+    advance_amount: Optional[int],
+) -> None:
     """
     Write a log into col_followups AND update col_updates latest status.
+    Also, when confirming, stamp rep_name and incentive for the *current user*.
     """
-    # 1) Immutable log (keep full trail)
+    # 1) Immutable log
     log_doc = {
         "itinerary_id": str(iid),
-        "created_at": datetime.utcnow(),      # system time
+        "created_at": datetime.utcnow(),
         "created_by": user,
-        "status": status,                     # "followup" | "confirmed" | "cancelled"
+        "status": status,  # "followup" | "confirmed" | "cancelled"
         "comment": str(comment or ""),
         "next_followup_on": (
             datetime.combine(next_followup_on, datetime.min.time())
             if next_followup_on else None
         ),
-        "cancellation_reason": (
-            str(cancellation_reason or "") if status == "cancelled" else ""
-        ),
+        "cancellation_reason": (str(cancellation_reason or "") if status == "cancelled" else ""),
     }
     base = col_itineraries.find_one({"_id": ObjectId(iid)}, {"client_name":1,"client_mobile":1,"ach_id":1})
     if base:
@@ -241,7 +241,7 @@ def upsert_update_status(iid: str, status: str, user: str,
         })
     col_followups.insert_one(log_doc)
 
-    # 2) Latest status snapshot
+    # 2) Latest status snapshot (+ incentive on confirm)
     upd = {
         "itinerary_id": str(iid),
         "status": status if status in ("followup", "cancelled") else "confirmed",
@@ -249,14 +249,19 @@ def upsert_update_status(iid: str, status: str, user: str,
         "updated_at": datetime.utcnow(),
     }
     if status == "confirmed":
+        # set booking info
         if booking_date:
             upd["booking_date"] = datetime.combine(booking_date, datetime.min.time())
         if advance_amount is not None:
             upd["advance_amount"] = int(advance_amount)
+        # incentive & owner (this user)
+        pkg_amt = _package_amount_for(iid)
+        upd["incentive"] = _compute_incentive(pkg_amt)
+        upd["rep_name"] = user  # <-- attribute incentive to the user who confirmed
     if status == "cancelled":
         upd["cancellation_reason"] = str(cancellation_reason or "")
-    col_updates.update_one({"itinerary_id": str(iid)}, {"$set": upd}, upsert=True)
 
+    col_updates.update_one({"itinerary_id": str(iid)}, {"$set": upd}, upsert=True)
 
 # ----------------------------
 # UI
@@ -294,11 +299,13 @@ due_tomorrow = int((df_assigned["next_followup_on"] == tmr).sum())
 due_week = int(((df_assigned["next_followup_on"] >= today) &
                 (df_assigned["next_followup_on"] <= in7)).sum())
 
-# incentives (this month & last month)
+# incentives & confirmation counts
 first_this, last_this = month_bounds(today)
 first_last, last_last = month_bounds(first_this - timedelta(days=1))
 this_month_incentive = fetch_confirmed_incentives(user, first_this, last_this)
 last_month_incentive = fetch_confirmed_incentives(user, first_last, last_last)
+confirmed_this_month = count_confirmed(user, first_this, last_this)
+confirmed_all_time   = count_confirmed(user)
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Assigned follow-ups", total_my_pkgs)
@@ -306,6 +313,10 @@ c2.metric("Due today", due_today)
 c3.metric("Due tomorrow", due_tomorrow)
 c4.metric("Due in next 7 days", due_week)
 c5.metric("My incentive", f"₹ {this_month_incentive:,}", help=f"Last month: ₹ {last_month_incentive:,}")
+
+c6, c7 = st.columns(2)
+c6.metric("Confirmed this month", confirmed_this_month)
+c7.metric("Confirmed (all time)", confirmed_all_time)
 
 st.divider()
 
@@ -369,6 +380,8 @@ with dc2:
         "Assigned To": upd_doc.get("assigned_to",""),
         "Booking date": upd_doc.get("booking_date",""),
         "Advance (₹)": upd_doc.get("advance_amount",0),
+        "Incentive (₹)": upd_doc.get("incentive",0),
+        "Rep (credited to)": upd_doc.get("rep_name",""),
     })
 
 with st.expander("Show full itinerary text"):
