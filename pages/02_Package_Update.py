@@ -28,7 +28,7 @@ except Exception:
 
 # ----------------------------
 # --- Admin gate (replace your current block with this) ---
-ADMIN_PASS_DEFAULT = "1234"          # your default
+ADMIN_PASS_DEFAULT = "333--"          # your default
 ADMIN_PASS = str(st.secrets.get("admin_pass", ADMIN_PASS_DEFAULT))
 
 with st.sidebar:
