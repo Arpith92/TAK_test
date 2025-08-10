@@ -5,7 +5,6 @@ import io
 import math
 import sys
 from datetime import datetime, date, time as dtime
-from typing import Optional
 
 import pandas as pd
 import requests
@@ -26,10 +25,12 @@ try:
 except Exception:
     CALENDAR_AVAILABLE = False
 
+
 # ----------------------------
-# --- Admin-only gate for THIS page (no PIN login here) ---
+# --- Admin-only gate (no PIN login here) ---
+# ----------------------------
 def require_admin():
-    ADMIN_PASS_DEFAULT = "Arpith&92"  # your admin password
+    ADMIN_PASS_DEFAULT = "Arpith&92--"  # set your default here
     ADMIN_PASS = str(st.secrets.get("admin_pass", ADMIN_PASS_DEFAULT))
 
     with st.sidebar:
@@ -37,82 +38,18 @@ def require_admin():
         p = st.text_input(
             "Enter admin password",
             type="password",
-            placeholder="Arpith&92--"
+            placeholder="Arpith&92--  (ends with two dashes)"
         )
 
-    # Trim spaces to avoid copy/paste issues
     if (p or "").strip() != ADMIN_PASS.strip():
         st.stop()
 
-    # Force the identity for this page to "Admin" regardless of any previous login
+    # Force identity for this page
     st.session_state["user"] = "Admin"
     st.session_state["is_admin"] = True
 
 require_admin()
-# ----------------------------------------------------------
 
-
-
-# ----------------------------
-# Fallback loader for users (kept in case you want to extend later)
-# ----------------------------
-def load_users() -> dict:
-    users = st.secrets.get("users", None)
-    if isinstance(users, dict) and users:
-        return users
-    try:
-        try:
-            import tomllib  # 3.11+
-        except Exception:
-            import tomli as tomllib
-        with open(".streamlit/secrets.toml", "rb") as f:
-            data = tomllib.load(f)
-        u = data.get("users", {})
-        if isinstance(u, dict) and u:
-            with st.sidebar:
-                st.warning("Using users from repo .streamlit/secrets.toml.")
-            return u
-    except Exception:
-        pass
-    return {}
-
-# ----------------------------
-# Optional: PIN login (you can remove if you only want the admin pass)
-# ----------------------------
-def _login() -> Optional[str]:
-    with st.sidebar:
-        if st.session_state.get("user"):
-            st.markdown(f"**Signed in as:** {st.session_state['user']}")
-            if st.button("Log out"):
-                st.session_state.pop("user", None)
-                st.rerun()
-
-    if st.session_state.get("user"):
-        return st.session_state["user"]
-
-    users_map = load_users()
-    if not users_map:
-        return "admin"  # allow admin-only mode via password gate above
-
-    st.markdown("### 🔐 Login")
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        name = st.selectbox("User", list(users_map.keys()), key="login_user")
-    with c2:
-        pin = st.text_input("PIN", type="password", key="login_pin")
-
-    if st.button("Sign in"):
-        if str(users_map.get(name, "")).strip() == str(pin).strip():
-            st.session_state["user"] = name
-            st.success(f"Welcome, {name}!")
-            st.rerun()
-        else:
-            st.error("Invalid PIN"); st.stop()
-    return None
-
-user = _login()
-if user is None:
-    st.stop()
 
 # ----------------------------
 # MongoDB Setup (with helpful errors)
@@ -140,6 +77,7 @@ col_updates     = db["package_updates"]
 col_expenses    = db["expenses"]
 col_vendorpay   = db["vendor_payments"]
 
+
 # ----------------------------
 # External Vendor Master (GitHub)
 # ----------------------------
@@ -151,6 +89,7 @@ VENDOR_SHEETS = {
     "Poojan": "Poojan",
     "PhotoFrame": "PhotoFrame",
 }
+
 
 # ----------------------------
 # Helpers
@@ -206,6 +145,15 @@ def _clean_for_mongo(obj):
     except Exception:
         pass
     return str(obj)
+
+def _str_or_blank(x):
+    try:
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return "" if x is None else str(x)
+
 
 # ----------------------------
 # Data loading / transforms
@@ -329,6 +277,7 @@ def group_latest_by_mobile(df_all: pd.DataFrame) -> pd.DataFrame:
     latest_rows["history_ids"] = latest_rows["client_mobile"].map(hist_map).apply(lambda x: x or [])
     return latest_rows
 
+
 # ----------------------------
 # Estimates & Vendor Payments
 # ----------------------------
@@ -421,6 +370,7 @@ def save_expense_summary(itinerary_id: str, client_name: str, booking_date, pack
     col_expenses.update_one({"itinerary_id": str(itinerary_id)}, {"$set": _clean_for_mongo(doc)}, upsert=True)
     return profit, total_expenses
 
+
 # ----------------------------
 # Load & Prep data
 # ----------------------------
@@ -446,6 +396,7 @@ for col_ in ["start_date", "end_date", "booking_date"]:
     if col_ in df.columns:
         df[col_] = df[col_].apply(to_date_or_none)
 
+
 # ----------------------------
 # Summary KPIs
 # ----------------------------
@@ -467,8 +418,9 @@ k4.metric("🔴 Cancelled", int(cancelled_count))
 
 st.divider()
 
+
 # ----------------------------
-# 1) Status Update (NO follow-ups here)
+# 1) Status Update (NO follow-ups shown here)
 # ----------------------------
 st.subheader("1) Update Status")
 view_mode = st.radio("View mode", ["Latest per client (by mobile)", "All packages"], horizontal=True)
@@ -499,6 +451,11 @@ else:
     editable["advance_amount"] = pd.to_numeric(editable["advance_amount"], errors="coerce").fillna(0).astype(int)
     for c in ["start_date","end_date","booking_date"]:
         editable[c] = editable[c].apply(to_date_or_none)
+
+    # normalize assigned_to so NaN won't break saves
+    if "assigned_to" not in editable.columns:
+        editable["assigned_to"] = ""
+    editable["assigned_to"] = editable["assigned_to"].apply(_str_or_blank)
 
     show_cols = [
         "ach_id","itinerary_id","client_name","client_mobile","final_route","total_pax",
@@ -569,7 +526,7 @@ else:
             if not sel:
                 st.warning("No rows selected.")
             else:
-                if bulk_status == "followup" and not bulk_assignee:
+                if bulk_status == "followup" and not _str_or_blank(bulk_assignee):
                     st.warning("Choose **Assign To** when moving to Follow-up.")
                 else:
                     for r_idx in sel:
@@ -584,7 +541,7 @@ else:
                             bulk_status,
                             bdate,
                             bulk_adv,
-                            assigned_to=bulk_assignee if bulk_status == "followup" else None
+                            assigned_to=_str_or_blank(bulk_assignee) if bulk_status == "followup" else None
                         )
                     st.success(f"Applied to {len(sel)} row(s).")
                     st.rerun()
@@ -595,7 +552,7 @@ else:
         for _, r in edited.iterrows():
             itinerary_id = r["itinerary_id"]
             status = r["status"]
-            assignee = (r.get("assigned_to") or "").strip()
+            assignee = _str_or_blank(r.get("assigned_to")).strip()
             bdate = r.get("booking_date")
             adv   = r.get("advance_amount", 0)
 
@@ -643,6 +600,7 @@ else:
                     st.dataframe(hist, use_container_width=True)
 
 st.divider()
+
 
 # ----------------------------
 # 2) Expenses & Vendor Payments (Confirmed Only)
@@ -799,6 +757,7 @@ else:
                 "final_date": final_date.isoformat() if final_date else None,
                 "balance": _to_int(bal),
             }
+            # upsert by category+vendor
             updated = False
             for i, it in enumerate(items):
                 if it.get("category")==c_cat and it.get("vendor")==vname:
@@ -818,6 +777,7 @@ else:
             st.caption("No vendor payments added yet.")
 
 st.divider()
+
 
 # ----------------------------
 # 3) Calendar – Confirmed Packages
