@@ -92,7 +92,7 @@ db = client["TAK_DB"]
 col_itineraries = db["itineraries"]
 col_updates     = db["package_updates"]
 col_followups   = db["followups"]
-col_expenses    = db["expenses"]  # <— used to read final package cost
+col_expenses    = db["expenses"]  # stores final package_cost etc.
 
 # ----------------------------
 # Helpers
@@ -257,11 +257,33 @@ def upsert_update_status(
         # incentive & owner (this user)
         pkg_amt = _package_amount_for(iid)
         upd["incentive"] = _compute_incentive(pkg_amt)
-        upd["rep_name"] = user  # <-- attribute incentive to the user who confirmed
+        upd["rep_name"] = user  # attribute incentive to the user who confirmed
     if status == "cancelled":
         upd["cancellation_reason"] = str(cancellation_reason or "")
 
     col_updates.update_one({"itinerary_id": str(iid)}, {"$set": upd}, upsert=True)
+
+def save_final_package_cost(iid: str, amount: int, user: str) -> None:
+    """
+    Persist final package cost to `expenses` and, if already confirmed,
+    recompute the incentive in `package_updates`.
+    """
+    doc = {
+        "itinerary_id": str(iid),
+        "package_cost": int(amount),
+        "saved_at": datetime.utcnow(),
+    }
+    col_expenses.update_one({"itinerary_id": str(iid)}, {"$set": doc}, upsert=True)
+
+    # If confirmed, refresh incentive immediately based on new cost.
+    upd = col_updates.find_one({"itinerary_id": str(iid)}, {"status": 1, "rep_name": 1})
+    if upd and upd.get("status") == "confirmed":
+        inc = _compute_incentive(int(amount))
+        rep = upd.get("rep_name") or user
+        col_updates.update_one(
+            {"itinerary_id": str(iid)},
+            {"$set": {"incentive": inc, "rep_name": rep}}
+        )
 
 # ----------------------------
 # UI
@@ -383,6 +405,25 @@ with dc2:
         "Incentive (₹)": upd_doc.get("incentive",0),
         "Rep (credited to)": upd_doc.get("rep_name",""),
     })
+
+# ---- Final Package Cost editor ----
+st.markdown("### Final package cost")
+_current_cost = _package_amount_for(chosen_id)
+new_cost = st.number_input(
+    "Final package cost (₹)",
+    min_value=0,
+    step=500,
+    value=int(_current_cost),
+    help="This will be saved to Expenses as the final package cost. "
+         "If the package is already confirmed, the incentive will be recalculated."
+)
+if st.button("💾 Save as final package cost"):
+    try:
+        save_final_package_cost(chosen_id, int(new_cost), user)
+        st.success("Final package cost saved. Incentive updated if the package was confirmed.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Could not save package cost: {e}")
 
 with st.expander("Show full itinerary text"):
     st.text_area("Itinerary shared with client",
